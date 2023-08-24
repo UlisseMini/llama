@@ -10,11 +10,7 @@ from typing import List, Literal, Optional, Tuple, TypedDict
 
 import torch
 import torch.nn.functional as F
-from fairscale.nn.model_parallel.initialize import (
-    get_model_parallel_rank,
-    initialize_model_parallel,
-    model_parallel_is_initialized,
-)
+
 
 from llama.model import ModelArgs, Transformer
 from llama.tokenizer import Tokenizer
@@ -55,31 +51,15 @@ class Llama:
         tokenizer_path: str,
         max_seq_len: int,
         max_batch_size: int,
-        model_parallel_size: Optional[int] = None,
     ) -> "Llama":
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group("nccl")
-        if not model_parallel_is_initialized():
-            if model_parallel_size is None:
-                model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
-            initialize_model_parallel(model_parallel_size)
-
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
-
         # seed must be the same in all processes
         torch.manual_seed(1)
-
-        if local_rank > 0:
-            sys.stdout = open(os.devnull, "w")
 
         start_time = time.time()
         checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
         assert len(checkpoints) > 0, f"no checkpoint files found in {ckpt_dir}"
-        assert model_parallel_size == len(
-            checkpoints
-        ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {model_parallel_size}"
-        ckpt_path = checkpoints[get_model_parallel_rank()]
+        assert len(checkpoints) <= 1, f"don't support loading from multiple checkpoints yet"
+        ckpt_path = checkpoints[0]
         checkpoint = torch.load(ckpt_path, map_location="cpu")
         with open(Path(ckpt_dir) / "params.json", "r") as f:
             params = json.loads(f.read())
@@ -92,8 +72,10 @@ class Llama:
         tokenizer = Tokenizer(model_path=tokenizer_path)
         model_args.vocab_size = tokenizer.n_words
         torch.set_default_tensor_type(torch.cuda.HalfTensor)
+
         model = Transformer(model_args)
         model.load_state_dict(checkpoint, strict=False)
+
         print(f"Loaded in {time.time() - start_time:.2f} seconds")
 
         return Llama(model, tokenizer)
@@ -106,6 +88,7 @@ class Llama:
     def generate(
         self,
         prompt_tokens: List[List[int]],
+        context_tokens: List[List[int]],
         max_gen_len: int,
         temperature: float = 0.6,
         top_p: float = 0.9,
@@ -122,17 +105,36 @@ class Llama:
         total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
 
         pad_id = self.tokenizer.pad_id
+        if pad_id == -1:
+            # print warning and set to 0. This is really a hack to make it work with the current tokenizer
+            # so I can debug other issues.
+            print(
+                "WARNING: pad_id not found in tokenizer, setting to 0. This may result in unexpected behavior.",
+                file=sys.stderr,
+            )
+            pad_id = 0
+
         tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
         for k, t in enumerate(prompt_tokens):
             tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
         if logprobs:
             token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
 
+        # pad context tokens as well
+        if context_tokens:
+            total_ctx_len, bsz_ctx = max(len(t) for t in context_tokens), len(context_tokens)
+            ctx_tokens = torch.full((bsz_ctx, total_ctx_len), pad_id, dtype=torch.long, device="cuda")
+            for k, t in enumerate(context_tokens):
+                ctx_tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+        else:
+            ctx_tokens = torch.tensor([], dtype=torch.long, device="cuda")
+
+
         prev_pos = 0
         eos_reached = torch.tensor([False] * bsz, device="cuda")
         input_text_mask = tokens != pad_id
         for cur_pos in range(min_prompt_len, total_len):
-            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            logits = self.model.forward(tokens[:, prev_pos:cur_pos], ctx_tokens, prev_pos)
             if logprobs:
                 token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
                     input=logits.transpose(1, 2),
@@ -181,6 +183,7 @@ class Llama:
     def text_completion(
         self,
         prompts: List[str],
+        context_docs: Optional[List[str]] = None,
         temperature: float = 0.6,
         top_p: float = 0.9,
         max_gen_len: Optional[int] = None,
@@ -190,8 +193,11 @@ class Llama:
         if max_gen_len is None:
             max_gen_len = self.model.params.max_seq_len - 1
         prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
+        context_tokens = [self.tokenizer.encode(x, bos=False, eos=False) for x in context_docs] if context_docs else []
+
         generation_tokens, generation_logprobs = self.generate(
             prompt_tokens=prompt_tokens,
+            context_tokens=context_tokens,
             max_gen_len=max_gen_len,
             temperature=temperature,
             top_p=top_p,
@@ -308,3 +314,4 @@ def sample_top_p(probs, p):
     next_token = torch.multinomial(probs_sort, num_samples=1)
     next_token = torch.gather(probs_idx, -1, next_token)
     return next_token
+
